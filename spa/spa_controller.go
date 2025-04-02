@@ -13,17 +13,22 @@ type SPAController struct {
 
 	lock  sync.RWMutex
 	files map[string]bool
+
+	directory string
+	file      string
 }
 
-func NewSPAController() *SPAController {
+func NewSPAController(directory, file string) *SPAController {
 	return &SPAController{
-		files: make(map[string]bool),
+		files:     make(map[string]bool),
+		directory: directory,
+		file:      directory + "/" + file,
 	}
 }
 
 func (sc *SPAController) Index(c *components.Context) error {
 	requestedPath := c.Request().URL.Path
-	filePath := filepath.Join("public", requestedPath)
+	filePath := filepath.Join(sc.directory, requestedPath)
 
 	sc.lock.RLock()
 	exists, inCache := sc.files[filePath]
@@ -33,7 +38,7 @@ func (sc *SPAController) Index(c *components.Context) error {
 		if exists {
 			return c.File(filePath)
 		}
-		return c.File("public/index.html")
+		return c.File(sc.file)
 	}
 
 	fileInfo, err := os.Stat(filePath)
@@ -47,5 +52,5 @@ func (sc *SPAController) Index(c *components.Context) error {
 	sc.lock.Lock()
 	sc.files[filePath] = false
 	sc.lock.Unlock()
-	return c.File("public/index.html")
+	return c.File(sc.file)
 }
