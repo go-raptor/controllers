@@ -26,8 +26,8 @@ func NewSPAController(directory, file string) *SPAController {
 	}
 }
 
-func (sc *SPAController) Index(c *components.Context) error {
-	requestedPath := c.Request().URL.Path
+func (sc *SPAController) Index(s components.State) error {
+	requestedPath := s.Request().URL.Path
 	filePath := filepath.Join(sc.directory, requestedPath)
 
 	sc.lock.RLock()
@@ -36,9 +36,9 @@ func (sc *SPAController) Index(c *components.Context) error {
 
 	if inCache {
 		if exists {
-			return c.File(filePath)
+			return s.File(filePath)
 		}
-		return c.File(sc.file)
+		return s.File(sc.file)
 	}
 
 	fileInfo, err := os.Stat(filePath)
@@ -46,11 +46,11 @@ func (sc *SPAController) Index(c *components.Context) error {
 		sc.lock.Lock()
 		sc.files[filePath] = true
 		sc.lock.Unlock()
-		return c.File(filePath)
+		return s.File(filePath)
 	}
 
 	sc.lock.Lock()
 	sc.files[filePath] = false
 	sc.lock.Unlock()
-	return c.File(sc.file)
+	return s.File(sc.file)
 }
