@@ -5,11 +5,11 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/go-raptor/components"
+	"github.com/go-raptor/raptor/v4"
 )
 
 type SPAController struct {
-	components.Controller
+	raptor.Controller
 
 	lock  sync.RWMutex
 	files map[string]bool
@@ -26,8 +26,8 @@ func NewSPAController(directory, file string) *SPAController {
 	}
 }
 
-func (sc *SPAController) Index(s components.State) error {
-	requestedPath := s.Request().URL.Path
+func (sc *SPAController) Index(c *raptor.Context) error {
+	requestedPath := c.Request().URL.Path
 	filePath := filepath.Join(sc.directory, requestedPath)
 
 	sc.lock.RLock()
@@ -36,9 +36,9 @@ func (sc *SPAController) Index(s components.State) error {
 
 	if inCache {
 		if exists {
-			return s.File(filePath)
+			return c.File(filePath)
 		}
-		return s.File(sc.file)
+		return c.File(sc.file)
 	}
 
 	fileInfo, err := os.Stat(filePath)
@@ -46,11 +46,11 @@ func (sc *SPAController) Index(s components.State) error {
 		sc.lock.Lock()
 		sc.files[filePath] = true
 		sc.lock.Unlock()
-		return s.File(filePath)
+		return c.File(filePath)
 	}
 
 	sc.lock.Lock()
 	sc.files[filePath] = false
 	sc.lock.Unlock()
-	return s.File(sc.file)
+	return c.File(sc.file)
 }
