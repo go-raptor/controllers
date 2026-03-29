@@ -3,7 +3,7 @@ package spa
 import (
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 
 	"github.com/go-raptor/raptor/v4"
 )
@@ -11,46 +11,29 @@ import (
 type SPAController struct {
 	raptor.Controller
 
-	lock  sync.RWMutex
-	files map[string]bool
-
 	directory string
-	file      string
+	indexFile string
 }
 
 func NewSPAController(directory, file string) *SPAController {
+	absDir, _ := filepath.Abs(directory)
 	return &SPAController{
-		files:     make(map[string]bool),
-		directory: directory,
-		file:      directory + "/" + file,
+		directory: absDir,
+		indexFile: filepath.Join(absDir, file),
 	}
 }
 
 func (sc *SPAController) Index(c *raptor.Context) error {
-	requestedPath := c.Request().URL.Path
-	filePath := filepath.Join(sc.directory, requestedPath)
+	filePath := filepath.Join(sc.directory, filepath.Clean("/"+c.Request().URL.Path))
 
-	sc.lock.RLock()
-	exists, inCache := sc.files[filePath]
-	sc.lock.RUnlock()
-
-	if inCache {
-		if exists {
-			return c.File(filePath)
-		}
-		return c.File(sc.file)
+	if !strings.HasPrefix(filePath, sc.directory) {
+		return c.File(sc.indexFile)
 	}
 
-	fileInfo, err := os.Stat(filePath)
-	if err == nil && !fileInfo.IsDir() {
-		sc.lock.Lock()
-		sc.files[filePath] = true
-		sc.lock.Unlock()
+	info, err := os.Stat(filePath)
+	if err == nil && !info.IsDir() {
 		return c.File(filePath)
 	}
 
-	sc.lock.Lock()
-	sc.files[filePath] = false
-	sc.lock.Unlock()
-	return c.File(sc.file)
+	return c.File(sc.indexFile)
 }
