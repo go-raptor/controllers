@@ -1,11 +1,85 @@
 package spa
 
 import (
+	"bytes"
+	"compress/gzip"
 	"mime"
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/andybalholm/brotli"
 )
+
+// representation is one encoding of a file, fully materialised in memory.
+type representation struct {
+	data []byte
+	etag string
+}
+
+// entry is an indexed file: its bytes in every encoding we can serve, plus
+// the headers that are identical on every request for it.
+type entry struct {
+	identity     representation
+	gzip         *representation
+	brotli       *representation
+	contentType  string
+	cacheControl string
+	modTime      time.Time
+}
+
+func (e *entry) compressed() bool { return e.gzip != nil || e.brotli != nil }
+
+func (e *entry) storedBytes() int64 {
+	n := int64(len(e.identity.data))
+	if e.gzip != nil {
+		n += int64(len(e.gzip.data))
+	}
+	if e.brotli != nil {
+		n += int64(len(e.brotli.data))
+	}
+	return n
+}
+
+// etagFor derives a representation's validator from the hash of the
+// *original* content, so replicas agree even if their compressors do not.
+func etagFor(base, encoding string) string {
+	if encoding == "" {
+		return `"` + base + `"`
+	}
+	return `"` + base + "-" + encoding + `"`
+}
+
+// Compression runs once at boot, so both codecs use their maximum level.
+func compressGzip(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(data); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// compressBrotli returns nil rather than an error: brotli is a bonus
+// encoding, and failing to produce it must not fail startup.
+func compressBrotli(data []byte) []byte {
+	var buf bytes.Buffer
+	w := brotli.NewWriterLevel(&buf, brotli.BestCompression)
+	if _, err := w.Write(data); err != nil {
+		return nil
+	}
+	if err := w.Close(); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
 
 // webTypes pins the types a frontend build actually contains.
 // mime.TypeByExtension consults /etc/mime.types on Linux, so leaving these
