@@ -1,10 +1,15 @@
 package spa
 
 import (
+	"bytes"
 	"net/http"
 	"path"
 	"strconv"
 	"strings"
+
+	"github.com/go-raptor/raptor/v4"
+	"github.com/go-raptor/raptor/v4/core"
+	"github.com/go-raptor/raptor/v4/errs"
 )
 
 const (
@@ -13,6 +18,65 @@ const (
 	headerETag         = "ETag"
 	headerSecFetchDest = "Sec-Fetch-Dest"
 )
+
+// Index serves one file from the in-memory build, or the SPA shell for a
+// client-side route. A request path is only ever a map key here — nothing
+// derived from the request reaches the filesystem, so there is no traversal
+// to defend against.
+func (sc *SPAController) Index(c *raptor.Context) error {
+	req := c.Request()
+
+	// The catch-all route matches every method, but a build artifact is only
+	// ever readable.
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		c.Response().Header().Set(core.HeaderAllow, "GET, HEAD")
+		return errs.NewErrorMethodNotAllowed("Method " + req.Method + " not allowed")
+	}
+
+	e, ok := sc.lookup(normalizeKey(req.URL.Path))
+	if !ok {
+		// Handing the shell to a request for a script or stylesheet turns a
+		// missing asset into an HTML parse error somewhere further along,
+		// which is far harder to diagnose than a 404.
+		if !isNavigation(req) {
+			return c.NotFound()
+		}
+		e = sc.fallback
+	}
+
+	sc.write(c, e)
+	return nil
+}
+
+func (sc *SPAController) write(c *raptor.Context, e *entry) {
+	req := c.Request()
+	res := c.Response()
+	header := res.Header()
+
+	header.Set(core.HeaderContentType, e.contentType)
+	header.Set(core.HeaderCacheControl, e.cacheControl)
+
+	rep := &e.identity
+	if e.compressed() {
+		// The body now depends on the request's Accept-Encoding, so any
+		// shared cache has to key on it.
+		header.Add(core.HeaderVary, core.HeaderAcceptEncoding)
+		switch negotiateEncoding(req.Header.Get(core.HeaderAcceptEncoding), e.brotli != nil, e.gzip != nil) {
+		case encodingBrotli:
+			rep = e.brotli
+			header.Set(core.HeaderContentEncoding, encodingBrotli)
+		case encodingGzip:
+			rep = e.gzip
+			header.Set(core.HeaderContentEncoding, encodingGzip)
+		}
+	}
+	header.Set(headerETag, rep.etag)
+
+	// ServeContent handles conditional requests against the ETag set above,
+	// plus Range and HEAD. The empty name stops it re-deriving a Content-Type
+	// we have already resolved deterministically.
+	http.ServeContent(res, req, "", e.modTime, bytes.NewReader(rep.data))
+}
 
 // normalizeKey turns a request path into an index key. net/http has already
 // percent-decoded URL.Path, and path.Clean collapses "." and ".." segments —

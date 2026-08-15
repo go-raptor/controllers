@@ -1,11 +1,37 @@
 package spa
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/andybalholm/brotli"
+	"github.com/go-raptor/raptor/v4/core"
 )
+
+// do runs one request through the controller, routing any returned error
+// through the framework's error path so the recorder sees a real status.
+func do(t *testing.T, sc *SPAController, req *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	ctx := core.NewContext(testCore(t), req, rec)
+	if err := sc.Index(ctx); err != nil {
+		ctx.Error(err)
+	}
+	return rec
+}
+
+// navRequest is a GET that looks like a browser navigating to a page.
+func navRequest(target string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set(headerSecFetchDest, "document")
+	return req
+}
 
 func TestNegotiateEncoding(t *testing.T) {
 	tests := []struct {
@@ -163,5 +189,292 @@ func TestIsNavigation(t *testing.T) {
 				t.Errorf("isNavigation() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIndexServesAnAsset(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	rec := do(t, sc, httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/javascript; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "public, max-age=31536000, immutable" {
+		t.Errorf("Cache-Control = %q", cc)
+	}
+	if rec.Body.String() != jsSource {
+		t.Error("body does not match the file")
+	}
+}
+
+func TestIndexRejectsNonReadMethods(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		rec := do(t, sc, httptest.NewRequest(method, "/_app/immutable/app.js", nil))
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s: status %d, want 405", method, rec.Code)
+		}
+		if allow := rec.Header().Get("Allow"); allow != "GET, HEAD" {
+			t.Errorf("%s: Allow = %q, want \"GET, HEAD\"", method, allow)
+		}
+		if strings.Contains(rec.Body.String(), "console.log") {
+			t.Errorf("%s: returned the file body", method)
+		}
+	}
+}
+
+func TestIndexServesHeadWithoutABody(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	rec := do(t, sc, httptest.NewRequest(http.MethodHead, "/_app/immutable/app.js", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("HEAD returned %d body bytes", rec.Body.Len())
+	}
+}
+
+func TestIndexFallsBackToTheShellForNavigations(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	rec := do(t, sc, navRequest("/dashboard/settings"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "shell") {
+		t.Error("did not serve the shell")
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", cc)
+	}
+}
+
+// A route containing a dot is the case an extension heuristic would break.
+func TestIndexFallsBackForRoutesContainingDots(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	rec := do(t, sc, navRequest("/users/john.doe"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "shell") {
+		t.Error("did not serve the shell")
+	}
+}
+
+// A missing chunk must fail as a missing chunk, not arrive as HTML that the
+// module loader then fails to parse.
+func TestIndexReturns404ForMissingSubresources(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/immutable/gone.js", nil)
+	req.Header.Set(headerSecFetchDest, "script")
+	rec := do(t, sc, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "shell") {
+		t.Error("served the HTML shell to a script request")
+	}
+}
+
+func TestIndexTraversalAttemptsCannotEscape(t *testing.T) {
+	base := t.TempDir()
+	writeFile(t, filepath.Join(base, "secret.txt"), "top secret")
+	dir := filepath.Join(base, "build")
+	writeFile(t, filepath.Join(dir, "index.html"), "<!doctype html><title>shell</title>")
+	sc := newController(t, dir)
+
+	targets := []string{
+		"/../secret.txt",
+		"/../../secret.txt",
+		"/_app/../../secret.txt",
+		"/%2e%2e/secret.txt",
+		"/..%2fsecret.txt",
+	}
+
+	for _, target := range targets {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set(headerSecFetchDest, "script")
+		rec := do(t, sc, req)
+
+		if strings.Contains(rec.Body.String(), "top secret") {
+			t.Errorf("%s escaped the build directory", target)
+		}
+	}
+}
+
+func TestIndexServesBrotliWhenAccepted(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rec := do(t, sc, req)
+
+	if enc := rec.Header().Get("Content-Encoding"); enc != "br" {
+		t.Fatalf("Content-Encoding = %q, want br", enc)
+	}
+	if vary := rec.Header().Get("Vary"); !strings.Contains(vary, "Accept-Encoding") {
+		t.Errorf("Vary = %q, want it to include Accept-Encoding", vary)
+	}
+	decoded, err := io.ReadAll(brotli.NewReader(bytes.NewReader(rec.Body.Bytes())))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(decoded) != jsSource {
+		t.Error("brotli body does not decode to the original file")
+	}
+}
+
+func TestIndexServesGzipWhenBrotliNotAccepted(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := do(t, sc, req)
+
+	if enc := rec.Header().Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", enc)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	decoded, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(decoded) != jsSource {
+		t.Error("gzip body does not decode to the original file")
+	}
+}
+
+func TestIndexServesIdentityWithoutAcceptEncoding(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	rec := do(t, sc, httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil))
+
+	if enc := rec.Header().Get("Content-Encoding"); enc != "" {
+		t.Errorf("Content-Encoding = %q, want none", enc)
+	}
+	if rec.Body.String() != jsSource {
+		t.Error("identity body does not match the file")
+	}
+}
+
+// An incompressible file has no variants, so no shared cache needs to key
+// on Accept-Encoding for it.
+func TestIndexOmitsVaryForUncompressedFiles(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	req := httptest.NewRequest(http.MethodGet, "/favicon.png", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rec := do(t, sc, req)
+
+	if vary := rec.Header().Get("Vary"); vary != "" {
+		t.Errorf("Vary = %q, want empty", vary)
+	}
+	if enc := rec.Header().Get("Content-Encoding"); enc != "" {
+		t.Errorf("Content-Encoding = %q, want none", enc)
+	}
+}
+
+func TestIndexAnswersConditionalRequests(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	first := do(t, sc, httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil))
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag on the first response")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil)
+	req.Header.Set("If-None-Match", etag)
+	second := do(t, sc, req)
+
+	if second.Code != http.StatusNotModified {
+		t.Fatalf("status %d, want 304", second.Code)
+	}
+	if second.Body.Len() != 0 {
+		t.Errorf("304 carried %d body bytes", second.Body.Len())
+	}
+}
+
+// The gzip body is a different representation, so it must not validate
+// against the identity ETag.
+func TestIndexETagsDifferPerEncoding(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	plain := do(t, sc, httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	encoded := do(t, sc, req)
+
+	if plain.Header().Get("ETag") == encoded.Header().Get("ETag") {
+		t.Error("identity and gzip responses share an ETag")
+	}
+}
+
+func TestIndexSupportsRangeRequests(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	req := httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil)
+	req.Header.Set("Range", "bytes=0-9")
+	rec := do(t, sc, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status %d, want 206", rec.Code)
+	}
+	if rec.Body.Len() != 10 {
+		t.Errorf("got %d bytes, want 10", rec.Body.Len())
+	}
+	if rec.Body.String() != jsSource[:10] {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+func TestIndexServesPrerenderedPages(t *testing.T) {
+	dir := buildDir(t)
+	writeFile(t, filepath.Join(dir, "about.html"), "<!doctype html>about page")
+	sc := newController(t, dir)
+
+	rec := do(t, sc, navRequest("/about"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "about page") {
+		t.Error("served the shell instead of the prerendered page")
+	}
+}
+
+// The design deliberately leaves these to middleware; this test records
+// that so a later change is a decision rather than an accident.
+func TestIndexSetsNoSecurityHeaders(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	rec := do(t, sc, navRequest("/"))
+
+	for _, header := range []string{
+		"X-Content-Type-Options",
+		"Content-Security-Policy",
+		"X-Frame-Options",
+		"Referrer-Policy",
+	} {
+		if v := rec.Header().Get(header); v != "" {
+			t.Errorf("%s = %q, want empty (middleware owns this)", header, v)
+		}
 	}
 }
