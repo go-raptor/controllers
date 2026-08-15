@@ -118,6 +118,21 @@ func contentTypeFor(path string, data []byte) string {
 	return http.DetectContentType(data)
 }
 
+// cacheControlFor picks a caching tier. Content-hashed assets can be kept
+// forever because a new build gives them a new URL; documents must be
+// revalidated or a returning visitor would never see a deploy.
+func cacheControlFor(key string, cfg SPAConfig) string {
+	for _, prefix := range cfg.ImmutablePrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return cfg.ImmutableCacheControl
+		}
+	}
+	if strings.HasSuffix(key, ".html") {
+		return cfg.DocumentCacheControl
+	}
+	return cfg.AssetCacheControl
+}
+
 // isCompressible reports whether a type is worth compressing. Images, woff2
 // and video are already compressed; running them through brotli burns boot
 // time and memory to produce something larger.

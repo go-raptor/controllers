@@ -122,3 +122,38 @@ func TestETagForDistinguishesEncodings(t *testing.T) {
 		}
 	}
 }
+
+func TestCacheControlFor(t *testing.T) {
+	cfg := SPAConfig{Directory: "build"}
+	cfg.applyDefaults()
+
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"/_app/immutable/chunks/app.a1b2c3.js", "public, max-age=31536000, immutable"},
+		{"/_app/immutable/assets/style.d4e5f6.css", "public, max-age=31536000, immutable"},
+		{"/index.html", "no-cache"},
+		{"/about.html", "no-cache"},
+		{"/favicon.png", "public, max-age=3600, must-revalidate"},
+		{"/robots.txt", "public, max-age=3600, must-revalidate"},
+		{"/_app/version.json", "public, max-age=3600, must-revalidate"},
+	}
+
+	for _, tt := range tests {
+		if got := cacheControlFor(tt.key, cfg); got != tt.want {
+			t.Errorf("cacheControlFor(%q) = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}
+
+// An empty prefix list disables the immutable tier entirely.
+func TestCacheControlForWithoutImmutableTier(t *testing.T) {
+	cfg := SPAConfig{Directory: "build", ImmutablePrefixes: []string{}}
+	cfg.applyDefaults()
+
+	got := cacheControlFor("/_app/immutable/app.js", cfg)
+	if got != "public, max-age=3600, must-revalidate" {
+		t.Errorf("cacheControlFor = %q, want the asset tier", got)
+	}
+}
