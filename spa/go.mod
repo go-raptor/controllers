@@ -1,4 +1,4 @@
-module github.com/go-raptor/controllers/spa
+module github.com/go-raptor/controllers/spa/v2
 
 go 1.26
 

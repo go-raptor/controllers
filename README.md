@@ -10,11 +10,11 @@ Serves a single-page application — a SvelteKit `adapter-static` build, or any
 equivalent — from the same server as your API.
 
 ```bash
-go get github.com/go-raptor/controllers/spa
+go get github.com/go-raptor/controllers/spa/v2
 ```
 
 ```go
-import "github.com/go-raptor/controllers/spa"
+import "github.com/go-raptor/controllers/spa/v2"
 
 spaController := spa.NewSPAController(spa.SPAConfig{
     Directory: "build",
@@ -97,3 +97,22 @@ This controller sets caching and encoding headers only. `X-Content-Type-Options`
 `Content-Security-Policy`, `X-Frame-Options` and `Referrer-Policy` are the
 responsibility of middleware, and are **not** currently set by anything in
 this ecosystem — configure them yourself.
+
+### Upgrading from v1
+
+v2 replaces the two-argument constructor with a config struct, so the import
+path gains a `/v2` suffix. v1 is unaffected and keeps working.
+
+```go
+// v1
+import "github.com/go-raptor/controllers/spa"
+spa.NewSPAController("public", "index.html")
+
+// v2
+import "github.com/go-raptor/controllers/spa/v2"
+spa.NewSPAController(spa.SPAConfig{Directory: "public"})
+```
+
+`IndexFile` only needs setting when it is not `index.html`. Remember that v2
+reads the build at startup, so a frontend rebuild now requires a server
+restart.
