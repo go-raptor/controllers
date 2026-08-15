@@ -1,6 +1,10 @@
 package spa
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestApplyDefaultsFillsEmptyFields(t *testing.T) {
 	cfg := SPAConfig{Directory: "build"}
@@ -57,5 +61,83 @@ func TestApplyDefaultsKeepsEmptyImmutablePrefixes(t *testing.T) {
 
 	if len(cfg.ImmutablePrefixes) != 0 {
 		t.Errorf("ImmutablePrefixes = %v, want empty", cfg.ImmutablePrefixes)
+	}
+}
+
+func TestSetupIndexesTheBuild(t *testing.T) {
+	sc := newController(t, buildDir(t))
+
+	if len(sc.index) != 3 {
+		t.Errorf("indexed %d files, want 3", len(sc.index))
+	}
+	if sc.fallback == nil {
+		t.Fatal("fallback entry is nil")
+	}
+	if sc.fallback != sc.index["/index.html"] {
+		t.Error("fallback is not the index file's entry")
+	}
+}
+
+func TestSetupFailsWithoutDirectory(t *testing.T) {
+	sc := NewSPAController(SPAConfig{})
+	sc.Init(testCore(t).Resources)
+
+	err := sc.Setup()
+	if err == nil {
+		t.Fatal("Setup succeeded with no Directory")
+	}
+	if !strings.Contains(err.Error(), "Directory is required") {
+		t.Errorf("unhelpful error: %v", err)
+	}
+}
+
+func TestSetupFailsOnMissingDirectory(t *testing.T) {
+	sc := NewSPAController(SPAConfig{Directory: filepath.Join(t.TempDir(), "nope")})
+	sc.Init(testCore(t).Resources)
+
+	if err := sc.Setup(); err == nil {
+		t.Fatal("Setup succeeded with a missing directory")
+	}
+}
+
+// An unbuilt frontend is the common deploy mistake; it must stop boot rather
+// than 404 every page at runtime.
+func TestSetupFailsWhenIndexFileMissing(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "app.js"), jsSource)
+
+	sc := NewSPAController(SPAConfig{Directory: dir})
+	sc.Init(testCore(t).Resources)
+
+	err := sc.Setup()
+	if err == nil {
+		t.Fatal("Setup succeeded without an index file")
+	}
+	if !strings.Contains(err.Error(), "index.html") {
+		t.Errorf("error does not name the missing file: %v", err)
+	}
+}
+
+func TestSetupFailsWhenDirectoryIsAFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "notadir")
+	writeFile(t, file, "x")
+
+	sc := NewSPAController(SPAConfig{Directory: file})
+	sc.Init(testCore(t).Resources)
+
+	if err := sc.Setup(); err == nil {
+		t.Fatal("Setup succeeded on a regular file")
+	}
+}
+
+func TestSetupHonoursCustomIndexFile(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "shell.html"), "<!doctype html>")
+
+	sc := newController(t, dir, func(c *SPAConfig) { c.IndexFile = "shell.html" })
+
+	if sc.fallback != sc.index["/shell.html"] {
+		t.Error("custom IndexFile was not used as the fallback")
 	}
 }
