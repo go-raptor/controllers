@@ -1,6 +1,8 @@
 package spa
 
 import (
+	"net/http"
+	"path"
 	"strconv"
 	"strings"
 )
@@ -11,6 +13,60 @@ const (
 	headerETag         = "ETag"
 	headerSecFetchDest = "Sec-Fetch-Dest"
 )
+
+// normalizeKey turns a request path into an index key. net/http has already
+// percent-decoded URL.Path, and path.Clean collapses "." and ".." segments —
+// but only so lookups behave predictably. It is not a containment check: an
+// escaping key simply fails to match anything, because keys are the only
+// thing a request can address.
+func normalizeKey(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if cleaned := path.Clean(p); cleaned != "." {
+		return cleaned
+	}
+	return "/"
+}
+
+// lookup resolves a URL path to an indexed file, accounting for the two
+// layouts adapter-static produces for prerendered pages: "/about" is stored
+// as about.html under trailingSlash "never" and about/index.html under
+// "always".
+func (sc *SPAController) lookup(key string) (*entry, bool) {
+	if e, ok := sc.index[key]; ok {
+		return e, true
+	}
+	if key == "/" {
+		return sc.fallback, true
+	}
+	if e, ok := sc.index[key+".html"]; ok {
+		return e, true
+	}
+	if e, ok := sc.index[key+"/index.html"]; ok {
+		return e, true
+	}
+	return nil, false
+}
+
+// isNavigation reports whether a request is a browser going to a page rather
+// than fetching a subresource. Sec-Fetch-Dest is the reliable signal and
+// every current browser sends it; the Accept check covers older clients.
+// A plain "curl /route" sends neither and gets a 404 — pass
+// -H 'Accept: text/html' to see what a browser would.
+func isNavigation(r *http.Request) bool {
+	switch r.Header.Get(headerSecFetchDest) {
+	case "document", "iframe", "frame", "embed", "object":
+		return true
+	case "":
+		return strings.Contains(r.Header.Get("Accept"), "text/html")
+	default:
+		return false
+	}
+}
 
 // negotiateEncoding picks the best encoding the client accepts that we
 // actually hold. Brotli wins ties because it compresses better, but an
