@@ -3,10 +3,16 @@ package spa
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"io/fs"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -116,6 +122,189 @@ func contentTypeFor(path string, data []byte) string {
 		return ct
 	}
 	return http.DetectContentType(data)
+}
+
+type indexStats struct {
+	raw     int64
+	stored  int64
+	skipped int
+}
+
+// candidate is a file the walk accepted, waiting for the expensive read and
+// compress step.
+type candidate struct {
+	path    string
+	key     string
+	modTime time.Time
+}
+
+func buildIndex(root string, cfg SPAConfig) (map[string]*entry, indexStats, error) {
+	candidates, stats, err := collectCandidates(root, cfg)
+	if err != nil {
+		return nil, stats, err
+	}
+
+	entries := make([]*entry, len(candidates))
+	failures := make([]error, len(candidates))
+
+	// Brotli at maximum level over a whole build is slow enough to show up
+	// in boot time, and each file is independent, so fan out across cores.
+	workers := min(runtime.GOMAXPROCS(0), len(candidates))
+	work := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range work {
+				entries[i], failures[i] = buildEntry(candidates[i], cfg)
+			}
+		}()
+	}
+	for i := range candidates {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
+
+	index := make(map[string]*entry, len(candidates))
+	for i, e := range entries {
+		if failures[i] != nil {
+			return nil, stats, failures[i]
+		}
+		index[candidates[i].key] = e
+		stats.raw += int64(len(e.identity.data))
+		stats.stored += e.storedBytes()
+	}
+	return index, stats, nil
+}
+
+func collectCandidates(root string, cfg SPAConfig) ([]candidate, indexStats, error) {
+	var candidates []candidate
+	var stats indexStats
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		// The root's own name is not content, and testing it for a leading
+		// dot would prune the whole walk for a build dir like ".output".
+		if path == root {
+			return nil
+		}
+
+		if !cfg.ServeDotfiles && strings.HasPrefix(d.Name(), ".") {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			stats.skipped++
+			return nil
+		}
+
+		// WalkDir reports symlinks without following them, and we keep it
+		// that way: a link inside the build directory can point anywhere on
+		// the filesystem, and following one is exactly the escape this
+		// design exists to prevent.
+		if d.Type()&fs.ModeSymlink != 0 {
+			stats.skipped++
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			stats.skipped++
+			return nil
+		}
+		// Precompressed siblings are folded into their base file's entry by
+		// buildEntry, so they must not become URLs of their own.
+		if strings.HasSuffix(d.Name(), ".br") || strings.HasSuffix(d.Name(), ".gz") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if cfg.MaxFileSize > 0 && info.Size() > cfg.MaxFileSize {
+			stats.skipped++
+			return nil
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		candidates = append(candidates, candidate{
+			path:    path,
+			key:     "/" + filepath.ToSlash(rel),
+			modTime: info.ModTime(),
+		})
+		return nil
+	})
+	return candidates, stats, err
+}
+
+func buildEntry(c candidate, cfg SPAConfig) (*entry, error) {
+	data, err := os.ReadFile(c.path)
+	if err != nil {
+		return nil, err
+	}
+
+	contentType := contentTypeFor(c.path, data)
+	sum := sha256.Sum256(data)
+	base := hex.EncodeToString(sum[:16])
+
+	e := &entry{
+		identity:     representation{data: data, etag: etagFor(base, "")},
+		contentType:  contentType,
+		cacheControl: cacheControlFor(c.key, cfg),
+		modTime:      c.modTime,
+	}
+
+	if int64(len(data)) < cfg.MinCompressSize || !isCompressible(contentType) {
+		return e, nil
+	}
+
+	br := precompressedSibling(c, ".br")
+	if br == nil {
+		br = compressBrotli(data)
+	}
+	if br != nil && len(br) < len(data) {
+		e.brotli = &representation{data: br, etag: etagFor(base, "br")}
+	}
+
+	gz := precompressedSibling(c, ".gz")
+	if gz == nil {
+		if gz, err = compressGzip(data); err != nil {
+			return nil, err
+		}
+	}
+	if gz != nil && len(gz) < len(data) {
+		e.gzip = &representation{data: gz, etag: etagFor(base, "gzip")}
+	}
+
+	return e, nil
+}
+
+// precompressedSibling returns the contents of path+ext when the build
+// already produced it, saving the slowest part of startup. It refuses
+// symlinks for the same reason the walk does, and anything older than the
+// file it claims to encode, which would be left over from a previous build.
+func precompressedSibling(c candidate, ext string) []byte {
+	sibling := c.path + ext
+	info, err := os.Lstat(sibling)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+	if info.ModTime().Before(c.modTime) {
+		return nil
+	}
+	data, err := os.ReadFile(sibling)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 // cacheControlFor picks a caching tier. Content-hashed assets can be kept

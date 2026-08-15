@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/andybalholm/brotli"
 )
@@ -155,5 +159,192 @@ func TestCacheControlForWithoutImmutableTier(t *testing.T) {
 	got := cacheControlFor("/_app/immutable/app.js", cfg)
 	if got != "public, max-age=3600, must-revalidate" {
 		t.Errorf("cacheControlFor = %q, want the asset tier", got)
+	}
+}
+
+func mustBuild(t *testing.T, dir string, mutate ...func(*SPAConfig)) map[string]*entry {
+	t.Helper()
+	cfg := SPAConfig{Directory: dir}
+	for _, m := range mutate {
+		m(&cfg)
+	}
+	cfg.applyDefaults()
+	index, _, err := buildIndex(dir, cfg)
+	if err != nil {
+		t.Fatalf("buildIndex: %v", err)
+	}
+	return index
+}
+
+func keysOf(index map[string]*entry) []string {
+	keys := make([]string, 0, len(index))
+	for k := range index {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func TestBuildIndexKeysAreRootedURLPaths(t *testing.T) {
+	index := mustBuild(t, buildDir(t))
+
+	for _, key := range []string{"/index.html", "/_app/immutable/app.js", "/favicon.png"} {
+		if _, ok := index[key]; !ok {
+			t.Errorf("missing key %q; have %v", key, keysOf(index))
+		}
+	}
+}
+
+// A build directory can pick up .env from a careless copy step, and .git or
+// .svelte-kit from the tooling. None of it is web content.
+func TestBuildIndexSkipsDotfiles(t *testing.T) {
+	dir := buildDir(t)
+	writeFile(t, filepath.Join(dir, ".env"), "SECRET=hunter2")
+	writeFile(t, filepath.Join(dir, ".git", "config"), "[core]")
+
+	index := mustBuild(t, dir)
+
+	if _, ok := index["/.env"]; ok {
+		t.Error("indexed /.env")
+	}
+	if _, ok := index["/.git/config"]; ok {
+		t.Error("indexed /.git/config")
+	}
+}
+
+func TestBuildIndexServesDotfilesWhenEnabled(t *testing.T) {
+	dir := buildDir(t)
+	writeFile(t, filepath.Join(dir, ".well-known", "assetlinks.json"), "[]")
+
+	index := mustBuild(t, dir, func(c *SPAConfig) { c.ServeDotfiles = true })
+
+	if _, ok := index["/.well-known/assetlinks.json"]; !ok {
+		t.Error("ServeDotfiles did not index /.well-known/assetlinks.json")
+	}
+}
+
+// This is the escape the old implementation allowed: filepath.Join resolved
+// ".." lexically but nothing stopped a symlink pointing out of the build.
+func TestBuildIndexNeverFollowsSymlinks(t *testing.T) {
+	secretDir := t.TempDir()
+	writeFile(t, filepath.Join(secretDir, "passwd"), "root:x:0:0")
+
+	dir := buildDir(t)
+	if err := os.Symlink(secretDir, filepath.Join(dir, "escape")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(secretDir, "passwd"), filepath.Join(dir, "leak.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	index := mustBuild(t, dir)
+
+	for key := range index {
+		if strings.HasPrefix(key, "/escape") || key == "/leak.txt" {
+			t.Errorf("indexed through a symlink: %q", key)
+		}
+	}
+}
+
+func TestBuildIndexRespectsMaxFileSize(t *testing.T) {
+	dir := buildDir(t)
+	writeFile(t, filepath.Join(dir, "huge.txt"), strings.Repeat("x", 5000))
+
+	index := mustBuild(t, dir, func(c *SPAConfig) { c.MaxFileSize = 1000 })
+
+	if _, ok := index["/huge.txt"]; ok {
+		t.Error("indexed a file above MaxFileSize")
+	}
+	if _, ok := index["/index.html"]; !ok {
+		t.Error("MaxFileSize dropped a file that was under the limit")
+	}
+}
+
+func TestBuildIndexCompressesOnlyWorthwhileFiles(t *testing.T) {
+	index := mustBuild(t, buildDir(t))
+
+	js := index["/_app/immutable/app.js"]
+	if js.brotli == nil || js.gzip == nil {
+		t.Error("compressible JS has no encoded variants")
+	}
+	if js.brotli != nil && len(js.brotli.data) >= len(js.identity.data) {
+		t.Error("kept a brotli variant no smaller than the original")
+	}
+
+	// index.html is under MinCompressSize, and the fake PNG is both small
+	// and an incompressible type.
+	if index["/index.html"].compressed() {
+		t.Error("compressed a file below MinCompressSize")
+	}
+	if index["/favicon.png"].compressed() {
+		t.Error("compressed an image")
+	}
+}
+
+// adapter-static's precompress option already produces these; reusing them
+// saves the slowest part of boot.
+func TestBuildIndexAdoptsPrecompressedSiblings(t *testing.T) {
+	dir := buildDir(t)
+	base := filepath.Join(dir, "_app", "immutable", "app.js")
+
+	gz, err := compressGzip([]byte(jsSource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(base+".gz", gz, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	index := mustBuild(t, dir)
+
+	if _, ok := index["/_app/immutable/app.js.gz"]; ok {
+		t.Error("indexed a precompressed sibling as its own URL")
+	}
+	e := index["/_app/immutable/app.js"]
+	if e.gzip == nil {
+		t.Fatal("did not adopt the .gz sibling")
+	}
+	if !bytes.Equal(e.gzip.data, gz) {
+		t.Error("adopted variant does not match the file on disk")
+	}
+}
+
+// A sibling older than its base file is left over from a previous build and
+// would serve stale bytes under a fresh ETag.
+func TestBuildIndexIgnoresStalePrecompressedSiblings(t *testing.T) {
+	dir := buildDir(t)
+	base := filepath.Join(dir, "_app", "immutable", "app.js")
+
+	if err := os.WriteFile(base+".br", []byte("stale garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(base+".br", old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	index := mustBuild(t, dir)
+
+	e := index["/_app/immutable/app.js"]
+	if e.brotli != nil && bytes.Equal(e.brotli.data, []byte("stale garbage")) {
+		t.Error("adopted a stale precompressed sibling")
+	}
+}
+
+func TestBuildIndexReportsStats(t *testing.T) {
+	cfg := SPAConfig{Directory: buildDir(t)}
+	cfg.applyDefaults()
+
+	index, stats, err := buildIndex(cfg.Directory, cfg)
+	if err != nil {
+		t.Fatalf("buildIndex: %v", err)
+	}
+	if stats.raw <= 0 {
+		t.Errorf("raw = %d, want > 0", stats.raw)
+	}
+	if stats.stored < stats.raw {
+		t.Errorf("stored = %d, want >= raw = %d", stats.stored, stats.raw)
+	}
+	if len(index) != 3 {
+		t.Errorf("indexed %d files, want 3", len(index))
 	}
 }
