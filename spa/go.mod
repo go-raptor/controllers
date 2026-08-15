@@ -2,9 +2,10 @@ module github.com/go-raptor/controllers/spa
 
 go 1.26
 
-require github.com/go-raptor/raptor/v4 v4.1.7
+require github.com/go-raptor/raptor/v4 v4.3.1
 
 require (
-	github.com/go-raptor/connectors v1.0.2 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	github.com/andybalholm/brotli v1.2.2 // indirect
+	github.com/go-raptor/connectors v1.1.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 )
