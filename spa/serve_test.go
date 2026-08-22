@@ -478,3 +478,49 @@ func TestIndexSetsNoSecurityHeaders(t *testing.T) {
 		}
 	}
 }
+
+// Nothing is indexed, so there is no shell to fall back to and no asset to
+// find — including on the paths that reach the fallback rather than a map
+// miss, which is where the nil dereference lived.
+func TestIndexReturns404WithoutABuild(t *testing.T) {
+	sc := newController(t, filepath.Join(t.TempDir(), "nope"), func(c *SPAConfig) { c.Optional = true })
+
+	tests := []struct {
+		name string
+		req  *http.Request
+	}{
+		{"root", navRequest("/")},
+		{"client-side route", navRequest("/dashboard/settings")},
+		{"the index file itself", navRequest("/index.html")},
+		{"subresource", httptest.NewRequest(http.MethodGet, "/_app/immutable/app.js", nil)},
+		{"head", httptest.NewRequest(http.MethodHead, "/", nil)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := do(t, sc, tt.req)
+
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status %d, want 404", rec.Code)
+			}
+			if rec.Body.Len() != 0 {
+				t.Errorf("404 carried a body: %q", rec.Body.String())
+			}
+		})
+	}
+}
+
+// A 405 here would name GET in Allow, and that GET would 404 too, so the
+// method check is skipped entirely when there is nothing to serve.
+func TestIndexWithoutABuildDoesNotAdvertiseAllow(t *testing.T) {
+	sc := newController(t, filepath.Join(t.TempDir(), "nope"), func(c *SPAConfig) { c.Optional = true })
+
+	rec := do(t, sc, httptest.NewRequest(http.MethodPost, "/", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); allow != "" {
+		t.Errorf("Allow = %q, want empty", allow)
+	}
+}

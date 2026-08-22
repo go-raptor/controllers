@@ -5,7 +5,9 @@
 package spa
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +20,12 @@ import (
 type SPAConfig struct {
 	// Directory is the built frontend to serve, e.g. "build".
 	Directory string `yaml:"directory"`
+
+	// Optional lets the controller boot when Directory holds no build,
+	// instead of failing Setup — a backend in development should not be held
+	// hostage by an unbuilt frontend. Every SPA route then 404s until the
+	// process restarts with a build in place.
+	Optional bool `yaml:"optional"`
 
 	// IndexFile is the shell served for client-side routes.
 	IndexFile string `yaml:"index_file"`
@@ -93,7 +101,8 @@ func NewSPAController(config SPAConfig) *SPAController {
 
 // Setup reads the entire build directory into memory. Raptor calls it after
 // resources are injected, and a returned error aborts boot — a missing or
-// unbuilt frontend should fail at startup, not on the first request.
+// unbuilt frontend should fail at startup, not on the first request, unless
+// SPAConfig.Optional trades that away.
 func (sc *SPAController) Setup() error {
 	sc.config.applyDefaults()
 
@@ -106,6 +115,12 @@ func (sc *SPAController) Setup() error {
 	}
 	info, err := os.Stat(root)
 	if err != nil {
+		// Absence is the state Optional exists for. A permission error or a
+		// broken mount is a deployment fault in either mode.
+		if sc.config.Optional && errors.Is(err, fs.ErrNotExist) {
+			sc.logUnbuilt(root, "directory does not exist")
+			return nil
+		}
 		return fmt.Errorf("spa: reading directory %q: %w", root, err)
 	}
 	if !info.IsDir() {
@@ -120,6 +135,13 @@ func (sc *SPAController) Setup() error {
 	indexKey := "/" + strings.TrimPrefix(filepath.ToSlash(sc.config.IndexFile), "/")
 	fallback, ok := index[indexKey]
 	if !ok {
+		// A checked-in public/ holding nothing but a .gitkeep is the same
+		// unbuilt state as no directory at all. Whatever else the walk found
+		// goes with it: an SPA without its shell is not worth half-serving.
+		if sc.config.Optional {
+			sc.logUnbuilt(root, "no "+sc.config.IndexFile)
+			return nil
+		}
 		return fmt.Errorf("spa: index file %q not found in %q", sc.config.IndexFile, root)
 	}
 
@@ -135,3 +157,17 @@ func (sc *SPAController) Setup() error {
 	)
 	return nil
 }
+
+// logUnbuilt is the only warning an operator gets: index and fallback stay
+// nil, nothing re-reads the directory, and the process serves 404s until it
+// is restarted.
+func (sc *SPAController) logUnbuilt(root, reason string) {
+	sc.Log.Warn("SPA build not found, every route will 404 until restart",
+		"directory", root,
+		"reason", reason,
+	)
+}
+
+// hasBuild reports whether Setup found a shell to serve. Only ever false
+// under SPAConfig.Optional, and fixed for the life of the process.
+func (sc *SPAController) hasBuild() bool { return sc.fallback != nil }

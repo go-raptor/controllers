@@ -4,6 +4,8 @@ github.com/go-raptor/connectors v1.1.0 h1:U6Fjhv68q7gIoFEAIKZGd5TtKygmZI8tG5TJt6
 github.com/go-raptor/connectors v1.1.0/go.mod h1:A7T++oNId2F9SB5i9IQcm+3QzruL5s1nFLfRk1eA0SU=
 github.com/go-raptor/raptor/v4 v4.3.1 h1:9hD1v91KrSwhDo/e9zHEEjq6Wa8RCaCttEC00frLzwI=
 github.com/go-raptor/raptor/v4 v4.3.1/go.mod h1:llA2fmqRtCOJ60AgzdmSJUwm4UhHVfdLIrm/e/H/oD0=
+github.com/go-raptor/raptor/v4 v4.3.2 h1:eQWQxv8ssXYLWZcQsdKxJEpajoTcbO3h3fikrVwX92s=
+github.com/go-raptor/raptor/v4 v4.3.2/go.mod h1:QBCZFYuM0SHuBfoaAmAbbnF6uLUHPTJA8gvnGl/7Jp0=
 github.com/xyproto/randomstring v1.0.5 h1:YtlWPoRdgMu3NZtP45drfy1GKoojuR7hmRcnhZqKjWU=
 github.com/xyproto/randomstring v1.0.5/go.mod h1:rgmS5DeNXLivK7YprL0pY+lTuhNQW3iGxZ18UQApw/E=
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=

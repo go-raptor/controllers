@@ -24,6 +24,14 @@ const (
 // derived from the request reaches the filesystem, so there is no traversal
 // to defend against.
 func (sc *SPAController) Index(c *raptor.Context) error {
+	// Optional let this controller boot with nothing indexed, so there is no
+	// resource here to describe — not even which methods it would accept.
+	// Ahead of the method check on purpose: a 405 would name a GET that has
+	// nothing to return either.
+	if !sc.hasBuild() {
+		return c.NotFound()
+	}
+
 	req := c.Request()
 
 	// The catch-all route matches every method, but a build artifact is only

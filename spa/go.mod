@@ -1,10 +1,10 @@
 module github.com/go-raptor/controllers/spa/v2
 
-go 1.26
+go 1.27
 
 require (
 	github.com/andybalholm/brotli v1.2.2
-	github.com/go-raptor/raptor/v4 v4.3.1
+	github.com/go-raptor/raptor/v4 v4.3.2
 )
 
 require (
